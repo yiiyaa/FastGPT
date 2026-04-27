@@ -1,39 +1,25 @@
 import { NodeInputKeyEnum, NodeOutputKeyEnum } from '@fastgpt/global/core/workflow/constants';
 import { DispatchNodeResponseKeyEnum } from '@fastgpt/global/core/workflow/runtime/constants';
-import type {
-  ChatDispatchProps,
-  DispatchNodeResultType,
-  RuntimeNodeItemType
-} from '@fastgpt/global/core/workflow/runtime/type';
+import type { DispatchNodeResultType } from '@fastgpt/global/core/workflow/runtime/type';
 import { getLLMModel } from '../../../../ai/model';
 import { filterToolNodeIdByEdges, getNodeErrResponse, getHistories } from '../../utils';
 import { runToolCall } from './toolCall';
 import { type DispatchToolModuleProps, type ToolNodeItemType } from './type';
-import type {
-  UserChatItemFileItemType,
-  ChatItemMiniType,
-  UserChatItemValueItemType
-} from '@fastgpt/global/core/chat/type';
+import type { UserChatItemFileItemType, ChatItemMiniType } from '@fastgpt/global/core/chat/type';
 import { ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
 import {
   GPTMessages2Chats,
-  chatValue2RuntimePrompt,
   chats2GPTMessages,
   getSystemPrompt_ChatItemType,
   runtimePrompt2ChatsValue
 } from '@fastgpt/global/core/chat/adapt';
 import { getHistoryPreview } from '@fastgpt/global/core/chat/utils';
-import { replaceVariable } from '@fastgpt/global/common/string/tools';
-import { getMultiplePrompt } from './constants';
 import { filterToolResponseToPreview } from './utils';
-import { getFileContentFromLinks, getHistoryFileLinks } from '../../tools/readFiles';
 import { parseUrlToFileType } from '../../../utils/context';
-import { FlowNodeTypeEnum } from '@fastgpt/global/core/workflow/node/constant';
-import { getDocumentQuotePrompt } from '@fastgpt/global/core/ai/prompt/AIChat';
+import { rewriteUserQueryWithFiles } from '../../../utils/file';
 import { postTextCensor } from '../../../../chat/postTextCensor';
 import type { FlowNodeInputItemType } from '@fastgpt/global/core/workflow/type/io';
 import type { McpToolDataType } from '@fastgpt/global/core/app/tool/mcpTool/type';
-import type { JSONSchemaInputType } from '@fastgpt/global/core/app/jsonschema';
 import { getToolConfigStatus } from '@fastgpt/global/core/app/formEdit/utils';
 
 type Response = DispatchNodeResultType<{
@@ -42,11 +28,10 @@ type Response = DispatchNodeResultType<{
 
 export const dispatchRunTools = async (props: DispatchToolModuleProps): Promise<Response> => {
   let {
-    node: { nodeId, name, isEntry, version, inputs },
+    node: { nodeId, isEntry, inputs },
     runtimeNodes,
     runtimeEdges,
     histories,
-    query,
     requestOrigin,
     chatConfig,
     lastInteractive,
@@ -126,69 +111,52 @@ export const dispatchRunTools = async (props: DispatchToolModuleProps): Promise<
 
     // Check interactive entry
     props.node.isEntry = false;
-    const hasReadFilesTool = toolNodes.some(
-      (item) => item.flowNodeType === FlowNodeTypeEnum.readFiles
-    );
 
-    const globalFiles = chatValue2RuntimePrompt(query).files;
-    const { documentQuoteText, userFiles } = await getMultiInput({
-      runningUserInfo,
-      histories: chatHistories,
-      requestOrigin,
-      maxFiles: chatConfig?.fileSelectConfig?.maxFiles || 20,
-      customPdfParse: chatConfig?.fileSelectConfig?.customPdfParse,
-      fileLinks,
-      inputFiles: globalFiles,
-      hasReadFilesTool,
-      usageId,
-      appId: props.runningAppInfo.id,
-      chatId: props.chatId,
-      uId: props.uid
+    const { userFiles } = await getMultiInput({
+      fileLinks
     });
 
-    const concatenateSystemPrompt = [
-      toolModel.defaultSystemChatPrompt,
-      systemPrompt,
-      documentQuoteText
-        ? replaceVariable(getDocumentQuotePrompt(version), {
-            quote: documentQuoteText
-          })
-        : ''
-    ]
+    const concatenateSystemPrompt = [toolModel.defaultSystemChatPrompt, systemPrompt]
       .filter(Boolean)
-      .join('\n\n===---===---===\n\n');
+      .join('\n\n-----\n\n');
 
-    const messages: ChatItemMiniType[] = (() => {
+    const messages = await (async () => {
       const value: ChatItemMiniType[] = [
         ...getSystemPrompt_ChatItemType(concatenateSystemPrompt),
-        // Add file input prompt to histories
-        ...chatHistories.map((item) => {
-          if (item.obj === ChatRoleEnum.Human) {
-            return {
-              ...item,
-              value: toolCallMessagesAdapt({
-                userInput: item.value,
-                skip: !hasReadFilesTool
-              })
-            };
-          }
-          return item;
-        }),
+        ...chatHistories,
         {
           obj: ChatRoleEnum.Human,
-          value: toolCallMessagesAdapt({
-            skip: !hasReadFilesTool,
-            userInput: runtimePrompt2ChatsValue({
-              text: userChatInput,
-              files: userFiles
-            })
+          value: runtimePrompt2ChatsValue({
+            text: userChatInput,
+            files: userFiles
           })
         }
       ];
-      if (lastInteractive && isEntry) {
-        return value.slice(0, -2);
-      }
-      return value;
+
+      const runtimeMessages = lastInteractive && isEntry ? value.slice(0, -2) : value;
+
+      const maxFiles = chatConfig?.fileSelectConfig?.maxFiles || 20;
+      return Promise.all(
+        runtimeMessages.map(async (message, index): Promise<ChatItemMiniType> => {
+          if (message.obj !== ChatRoleEnum.Human) {
+            return message;
+          }
+
+          return {
+            ...message,
+            value: await rewriteUserQueryWithFiles({
+              queryId: message.dataId || `${index}`,
+              userQuery: message.value,
+              requestOrigin,
+              maxFiles,
+              customPdfParse: chatConfig?.fileSelectConfig?.customPdfParse,
+              usageId,
+              teamId: runningUserInfo.teamId,
+              tmbId: runningUserInfo.tmbId
+            })
+          };
+        })
+      );
     })();
 
     // censor model and system key
@@ -310,115 +278,10 @@ export const dispatchRunTools = async (props: DispatchToolModuleProps): Promise<
   }
 };
 
-const getMultiInput = async ({
-  runningUserInfo,
-  histories,
-  fileLinks,
-  requestOrigin,
-  maxFiles,
-  customPdfParse,
-  inputFiles,
-  hasReadFilesTool,
-  usageId,
-  appId,
-  chatId,
-  uId
-}: {
-  runningUserInfo: ChatDispatchProps['runningUserInfo'];
-  histories: ChatItemMiniType[];
-  fileLinks?: string[];
-  requestOrigin?: string;
-  maxFiles: number;
-  customPdfParse?: boolean;
-  inputFiles: UserChatItemFileItemType[];
-  hasReadFilesTool: boolean;
-  usageId?: string;
-  appId: string;
-  chatId?: string;
-  uId: string;
-}) => {
-  // Not file quote
-  if (!fileLinks || hasReadFilesTool) {
-    return {
-      documentQuoteText: '',
-      userFiles: inputFiles
-    };
-  }
-
-  const filesFromHistories = getHistoryFileLinks(histories);
-  const urls = [...fileLinks, ...filesFromHistories];
-
-  if (urls.length === 0) {
-    return {
-      documentQuoteText: '',
-      userFiles: []
-    };
-  }
-
-  // Get files from histories
-  const { text } = await getFileContentFromLinks({
-    // Concat fileUrlList and filesFromHistories; remove not supported files
-    urls,
-    requestOrigin,
-    maxFiles,
-    customPdfParse,
-    usageId,
-    teamId: runningUserInfo.teamId,
-    tmbId: runningUserInfo.tmbId
-  });
-
+const getMultiInput = async ({ fileLinks = [] }: { fileLinks?: string[] }) => {
   return {
-    documentQuoteText: text,
     userFiles: fileLinks
       .map((url) => parseUrlToFileType(url))
       .filter(Boolean) as UserChatItemFileItemType[]
   };
-};
-
-/*
-Tool call， auth add file prompt to question。
-Guide the LLM to call tool.
-*/
-const toolCallMessagesAdapt = ({
-  userInput,
-  skip
-}: {
-  userInput: UserChatItemValueItemType[];
-  skip?: boolean;
-}): UserChatItemValueItemType[] => {
-  if (skip) return userInput;
-
-  const files = userInput.filter((item) => 'file' in item);
-
-  if (files.length > 0) {
-    const filesCount = files.filter((file) => file.file?.type === 'file').length;
-    const imgCount = files.filter((file) => file.file?.type === 'image').length;
-
-    if (userInput.some((item) => 'text' in item)) {
-      return userInput.map((item) => {
-        if ('text' in item) {
-          const text = item.text?.content || '';
-
-          return {
-            ...item,
-            text: {
-              content: getMultiplePrompt({ fileCount: filesCount, imgCount, question: text })
-            }
-          };
-        }
-        return item;
-      });
-    }
-
-    // Every input is a file
-    return [
-      {
-        text: {
-          content: getMultiplePrompt({ fileCount: filesCount, imgCount, question: '' })
-        }
-      }
-    ];
-  }
-
-  return userInput;
 };
