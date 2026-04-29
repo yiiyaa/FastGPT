@@ -19,6 +19,7 @@ import type { WorkflowResponseType } from '../../../../service/core/workflow/dis
 import type { AiChatQuoteRoleType } from '../template/system/aiChat/type';
 import type { OpenaiAccountType } from '../../../support/user/team/type';
 import { CompletionFinishReasonSchema } from '../../ai/llm/type';
+import type { ReasoningEffort } from '../../ai/llm/type';
 import type {
   InteractiveNodeResponseType,
   WorkflowInteractiveResponseType
@@ -380,6 +381,7 @@ export type AIChatNodeProps = {
   [NodeInputKeyEnum.aiChatIsResponseText]: boolean;
   [NodeInputKeyEnum.aiChatVision]?: boolean;
   [NodeInputKeyEnum.aiChatReasoning]?: boolean;
+  [NodeInputKeyEnum.aiChatReasoningEffort]?: ReasoningEffort;
   [NodeInputKeyEnum.aiChatTopP]?: number;
   [NodeInputKeyEnum.aiChatStopSign]?: string;
   [NodeInputKeyEnum.aiChatResponseFormat]?: string;
